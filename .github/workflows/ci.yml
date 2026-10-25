@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [18, 20, 22]
+        # Vitest 3 / Vite 7 need Node ≥ 20.19 to run the suite; the plugin itself still targets Node ≥ 18.
+        node: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
