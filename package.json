@@ -1,0 +1,53 @@
+{
+  "name": "signalk-fleetai",
+  "version": "0.1.0",
+  "description": "Signal K server plugin that pushes onboard instrument readings (engines, navigation, batteries, tanks, environment, alarms, AIS targets) to FleetAi.",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-cloud",
+    "signalk",
+    "fleetai",
+    "telemetry",
+    "boat"
+  ],
+  "homepage": "https://github.com/MaloLebrin/signalk-fleetai#readme",
+  "bugs": {
+    "url": "https://github.com/MaloLebrin/signalk-fleetai/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MaloLebrin/signalk-fleetai.git"
+  },
+  "license": "MIT",
+  "author": "Malo Lebrin",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "npm run clean && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@signalk/server-api": "^2.35.0",
+    "@types/node": "^18.19.0",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^3.0.0"
+  }
+}
