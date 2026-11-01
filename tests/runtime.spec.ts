@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createRuntime } from '../src/runtime'
 import { createSender } from '../src/sender'
-import { aisDelta, harness, scriptedFetch, selfDelta, SELF, T0 } from './helpers/runtime'
+import { aisDelta, config, harness, scriptedFetch, selfDelta, SELF, T0 } from './helpers/runtime'
 
 const MIN = 60_000
 
@@ -262,7 +262,7 @@ describe('runtime — persistence across restarts', () => {
     })
     const clock = { now: T0 }
     const runtime = createRuntime({
-      config: { endpoint: 'http://x', token: 'fai_ing_x', periodSeconds: 60, paths: [] },
+      config: config({ endpoint: 'http://x', token: 'fai_ing_x' }),
       selfContext: SELF,
       queueFilePath: `${harness({ fetch: scriptedFetch([{ status: 200 }]).fetch }).queueFilePath}.b`,
       sender,

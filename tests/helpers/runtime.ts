@@ -14,6 +14,8 @@ export function config(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig 
     token: 'fai_ing_test',
     periodSeconds: 60,
     paths: [],
+    hideSerialNumbers: false,
+    inventoryEndpoint: 'http://fleetai.test/api/instruments/inventory',
     ...overrides,
   }
 }

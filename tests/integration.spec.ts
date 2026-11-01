@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPlugin as plugin } from '../src/plugin'
 import { createFakeApp } from './helpers/fake_app'
 import { startFakeFleetAi } from './helpers/fake_fleetai'
+import { BOAT_DELTAS, sourcesTree } from './helpers/inventory'
 import { aisDelta, selfDelta } from './helpers/runtime'
 import type { Plugin, ServerAPI } from '@signalk/server-api'
 
@@ -126,6 +127,114 @@ describe('integration — plugin against a fake FleetAi endpoint', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(fleetai.received).toHaveLength(1)
+  })
+
+  describe('device inventory', () => {
+    afterEach(() => vi.useRealTimers())
+
+    it('posts the inventory to /inventory with the token, then only on change', async () => {
+      const fleetai = await startFakeFleetAi((batch) =>
+        batch.path.endsWith('/inventory')
+          ? { status: 201, body: { created: 4, updated: 0, gone: 0 } }
+          : { status: 200 }
+      )
+      cleanups.push(fleetai.close)
+      const fake = createFakeApp(SELF, sourcesTree())
+      const instance = plugin(fake.app as unknown as ServerAPI)
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] })
+      instance.start(
+        { endpoint: fleetai.url, token: 'fai_ing_inv', hideSerialNumbers: true },
+        () => {}
+      )
+      cleanups.push(() => void instance.stop())
+      for (const delta of BOAT_DELTAS) fake.emit(delta)
+
+      await vi.advanceTimersByTimeAsync(15_000)
+      await vi.waitFor(() => expect(fleetai.received).toHaveLength(1))
+      const request = fleetai.received[0]!
+      expect(request.path).toBe('/api/instruments/inventory')
+      expect(request.authorization).toBe('Bearer fai_ing_inv')
+      expect(request.userAgent).toMatch(/^signalk-fleetai\//)
+      const devices = (request.body as unknown as { devices: Array<Record<string, unknown>> })
+        .devices
+      expect(devices).toHaveLength(4)
+      expect(JSON.stringify(devices)).not.toContain('SN-0042') // "hide" is on
+      expect(devices.find((d) => d.address === 12)!.serialNumber).toMatch(/^h:[0-9a-f]{8}$/)
+
+      // Nothing changed: the next checks stay silent.
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(fleetai.received.filter((r) => r.path.endsWith('/inventory'))).toHaveLength(1)
+
+      // A new path on a known device: re-announced.
+      fake.emit({
+        context: SELF,
+        updates: [
+          {
+            $source: 'can0.34',
+            values: [{ path: 'electrical.batteries.house.current', value: 4 }],
+          },
+        ],
+      })
+      await vi.advanceTimersByTimeAsync(15_000)
+      await vi.waitFor(() =>
+        expect(fleetai.received.filter((r) => r.path.endsWith('/inventory'))).toHaveLength(2)
+      )
+    })
+
+    it('falls back on PGN 126996 / 60928 when sources has no metadata, and stops listening on stop', async () => {
+      const fleetai = await startFakeFleetAi(() => ({ status: 201, body: {} }))
+      cleanups.push(fleetai.close)
+      const fake = createFakeApp(SELF, { can0: { type: 'NMEA2000' } })
+      const instance = plugin(fake.app as unknown as ServerAPI)
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] })
+      instance.start({ endpoint: fleetai.url, token: 'fai_ing_inv' }, () => {})
+      expect(fake.pgnListenerCount()).toBe(1)
+
+      fake.emit({
+        context: SELF,
+        updates: [
+          { $source: 'can0.41', values: [{ path: 'tanks.fuel.0.currentLevel', value: 0.5 }] },
+        ],
+      })
+      fake.emitPgn({ pgn: 126996, src: 41, fields: { 'Model ID': 'TLM100' } })
+      fake.emitPgn({ pgn: 60928, src: 41, fields: { 'Manufacturer Code': 'Maretron' } })
+      await vi.advanceTimersByTimeAsync(15_000)
+      await vi.waitFor(() => expect(fleetai.received).toHaveLength(1))
+      expect(fleetai.received[0]!.body).toMatchObject({
+        devices: [
+          {
+            label: 'Maretron TLM100',
+            model: 'TLM100',
+            address: 41,
+            paths: ['tanks.fuel.0.currentLevel'],
+          },
+        ],
+      })
+
+      await instance.stop()
+      expect(fake.pgnListenerCount()).toBe(0)
+    })
+
+    it('a revoked token on the inventory stops the plugin visibly, with a single request', async () => {
+      const fleetai = await startFakeFleetAi((batch) =>
+        batch.path.endsWith('/inventory')
+          ? { status: 401, body: { error: 'unauthorized' } }
+          : { status: 200 }
+      )
+      cleanups.push(fleetai.close)
+      const fake = createFakeApp(SELF, sourcesTree())
+      const instance = plugin(fake.app as unknown as ServerAPI)
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] })
+      instance.start({ endpoint: fleetai.url, token: 'fai_ing_revoked' }, () => {})
+      cleanups.push(() => void instance.stop())
+      fake.emit(BOAT_DELTAS[0]!)
+
+      await vi.advanceTimersByTimeAsync(15_000)
+      await vi.waitFor(() => expect(fake.errors.at(-1)).toMatch(/^Token rejected/))
+      await vi.advanceTimersByTimeAsync(10 * 60_000)
+      expect(fleetai.received).toHaveLength(1)
+      expect(fake.pgnListenerCount()).toBe(0)
+    })
   })
 
   it('refuses to start without a token and says so', () => {

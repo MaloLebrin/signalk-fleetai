@@ -37,17 +37,19 @@ Stored by the server in `plugin-config-data/signalk-fleetai.json`:
     "endpoint": "https://fleetai.app/api/instruments/ingest",
     "token": "fai_ing_…",
     "periodSeconds": 60,
-    "paths": []
+    "paths": [],
+    "hideSerialNumbers": false
   }
 }
 ```
 
-| Setting         | Default                                      | Meaning                                                                                                                                                                        |
-| --------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `endpoint`      | `https://fleetai.app/api/instruments/ingest` | FleetAi ingestion URL. Self-hosted instances show theirs in the Signal K plugin card.                                                                                          |
-| `token`         | —                                            | Ingestion token generated in FleetAi, one per boat. Regenerating or revoking it in FleetAi stops this plugin with an explicit error.                                           |
-| `periodSeconds` | `60` (min `10`, max `3600`)                  | Aggregation window and send period. Paths the FleetAi catalog samples more slowly keep their slower cadence (engine hours every 5 min, tank capacity hourly, AIS every 5 min). |
-| `paths`         | `[]`                                         | Extra numeric Signal K paths or wildcards (`electrical.ac.*.voltage`) sent on top of the catalog. A path FleetAi refuses (`422 path_not_allowed`) is dropped for the session.  |
+| Setting             | Default                                      | Meaning                                                                                                                                                                        |
+| ------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `endpoint`          | `https://fleetai.app/api/instruments/ingest` | FleetAi ingestion URL. Self-hosted instances show theirs in the Signal K plugin card.                                                                                          |
+| `token`             | —                                            | Ingestion token generated in FleetAi, one per boat. Regenerating or revoking it in FleetAi stops this plugin with an explicit error.                                           |
+| `periodSeconds`     | `60` (min `10`, max `3600`)                  | Aggregation window and send period. Paths the FleetAi catalog samples more slowly keep their slower cadence (engine hours every 5 min, tank capacity hourly, AIS every 5 min). |
+| `hideSerialNumbers` | `false`                                      | Device inventory only: replace NMEA 2000 serial numbers by a short hash (`h:7f3a9c21`) so they never leave the boat in clear. See [Device inventory](#device-inventory).       |
+| `paths`             | `[]`                                         | Extra numeric Signal K paths or wildcards (`electrical.ac.*.voltage`) sent on top of the catalog. A path FleetAi refuses (`422 path_not_allowed`) is dropped for the session.  |
 
 ## What is sent
 
@@ -56,6 +58,60 @@ Stored by the server in `plugin-config-data/signalk-fleetai.json`:
 - **Units are left exactly as Signal K emits them** (SI: Hz, K, Pa, m/s, rad, m³, ratios 0–1). FleetAi converts at display time.
 - **`recordedAt`** is the server's clock floored to the start of the window — never the NMEA timestamp. The same window always produces the same `(path, recordedAt)`, so a replayed batch is idempotent on the FleetAi side.
 - Each `POST {endpoint}` carries `Authorization: Bearer <token>`, a JSON body `{ batchId: <uuid>, samples: [...] }` with at most 500 samples, and no `sourceId` (the token identifies the boat).
+
+## Device inventory
+
+Besides the readings, the plugin tells FleetAi **which devices feed them** (engine ECU, battery monitor, tank sender, GPS…), so the Instruments tab can show what is connected and propose to link it to your equipment.
+
+**Where it comes from.** A device exists while it has been heard from in the last 10 minutes, as the source (`$source`) of a catalog path:
+
+- **NMEA 2000** — read from the server's `sources` tree: `n2k.manufacturerName`, `productName`, `serialNumber`, `deviceFunction`, and the address (`src`).
+- **NMEA 0183** — one device per connection: its label (`NMEA 0183 ttyUSB0 (GGA, RMC)`) with the sentences seen.
+- **Fallback** — when `sources` does not carry the NMEA 2000 metadata, the plugin also listens to the server's `N2KAnalyzerOut` events for **PGN 126996** (product information) and **PGN 60928** (address claim) and fills in what is missing. The `sources` tree wins when both know a field.
+- Plugin and derived-data sources (`derived-data`, …) are not devices of the boat and are left out. Alarms (`notifications.*`) are not attributed to a device. Only catalog paths are listed (≤ 64 devices, ≤ 100 paths each).
+
+**`deviceId`** is a stable fingerprint: `n2k-` + 16 hex of SHA-256 over manufacturer + model + serial number (lower-cased), so it survives an address change; `nmea0183-<connection>` for a serial/UDP connection. Two identical devices with no serial number are told apart by their address. The serial number is never part of the id.
+
+**Serial numbers.** Sent in clear by default (it helps tell two identical devices apart in FleetAi). With **Hide device serial numbers** ticked, `serialNumber` becomes `h:` + 8 hex of a salted SHA-256 — stable, so the device stays recognised, but not reversible to the serial number. Serial numbers are never written to the Signal K log.
+
+**When.** `POST <endpoint>/inventory` — i.e. `https://fleetai.app/api/instruments/inventory` for the default endpoint (`/ingest` is replaced by `/inventory`) — with the same `Authorization: Bearer fai_ing_…` token as the readings:
+
+- as soon as at least one device is known after (re)start, then on every change: a device appears, a device has been silent for more than 10 minutes, or a device provides a new catalog path;
+- **at most once a minute**, the change being checked every 15 s;
+- the body is the **complete state** (`{ "devices": [...] }`), FleetAi marking a missing device as gone after its own 10-minute grace.
+
+Answers follow the batch rules: `201 { created, updated, gone }`; `401` / `403` / `404` / `409` stop the plugin with a visible error; `429` waits for `Retry-After`, network errors and `5xx` back off from 1 min (cap 5 min) and resend the current state; `422` is logged (error code only, never the device list) and the same list is not sent again until it changes.
+
+Example body:
+
+```json
+{
+  "devices": [
+    {
+      "deviceId": "n2k-a1b2c3d4e5f60718",
+      "label": "Victron Energy BMV-712",
+      "manufacturer": "Victron Energy",
+      "model": "BMV-712",
+      "serialNumber": "h:7f3a9c21",
+      "function": "Battery",
+      "bus": "n2k",
+      "address": 34,
+      "paths": [
+        "electrical.batteries.house.voltage",
+        "electrical.batteries.house.capacity.stateOfCharge"
+      ]
+    },
+    {
+      "deviceId": "nmea0183-ttyUSB0",
+      "label": "NMEA 0183 ttyUSB0 (GGA, RMC)",
+      "bus": "nmea0183",
+      "paths": ["navigation.position", "navigation.speedOverGround"]
+    }
+  ]
+}
+```
+
+> **Not yet validated on real hardware.** The `sources` field names (`n2k.manufacturerName`…) and the `N2KAnalyzerOut` message fields follow the FleetAi contract and the canboat analyzer, and are covered by unit, contract and integration tests against fakes only. Checking them on a real NMEA 2000 bus (protocol T11) is still to be done.
 
 ## Offline behaviour and errors
 
@@ -76,7 +132,7 @@ Plugin status (Server → Plugin Config, and the Dashboard):
 
 ```bash
 npm install
-npm test          # Vitest: aggregation, 500-sample batches, idempotent replay, every HTTP code, queue persistence, integration against a fake endpoint
+npm test          # Vitest: aggregation, 500-sample batches, idempotent replay, every HTTP code, queue persistence, device inventory (build, hashing, hide, rate limit, disappearance, FleetAi fixture contract), integration against a fake endpoint
 npm run lint      # ESLint + Prettier
 npm run typecheck
 npm run build     # dist/ (CommonJS, Node ≥ 18)

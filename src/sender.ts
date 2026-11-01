@@ -1,3 +1,4 @@
+import type { InventoryPayload } from './inventory'
 import type { BatchPayload } from './types'
 
 /**
@@ -10,11 +11,7 @@ import type { BatchPayload } from './types'
  * - `drop`     — 4xx the batch itself caused (422, 413…): log it, abandon it.
  */
 
-export type SendOutcome =
-  | { kind: 'accepted'; accepted: number; ignored: number }
-  | { kind: 'retry'; status: number | null; retryAfterMs: number | null; message: string }
-  | { kind: 'fatal'; status: number; error: string; message: string }
-  | { kind: 'drop'; status: number; error: string; path: string | null; message: string }
+export type SendOutcome = { kind: 'accepted'; accepted: number; ignored: number } | FailureOutcome
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>
 
@@ -67,16 +64,34 @@ function retryAfterMs(response: Response, body: Record<string, unknown> | null):
   return null
 }
 
-export function createSender(options: SenderOptions) {
+export type FailureOutcome =
+  | { kind: 'retry'; status: number | null; retryAfterMs: number | null; message: string }
+  | { kind: 'fatal'; status: number; error: string; message: string }
+  | { kind: 'drop'; status: number; error: string; path: string | null; message: string }
+
+export type InventorySendOutcome =
+  { kind: 'accepted'; created: number; updated: number; gone: number } | FailureOutcome
+
+type PostResult = { kind: 'ok'; body: Record<string, unknown> | null } | FailureOutcome
+
+/**
+ * One authenticated JSON POST, with the answer classified the same way for
+ * every FleetAi endpoint (`successStatuses` are the codes meaning "accepted").
+ */
+function createPoster(options: SenderOptions) {
   const fetchImpl: FetchLike = options.fetch ?? ((input, init) => fetch(input, init))
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
 
-  async function send(batch: BatchPayload): Promise<SendOutcome> {
+  return async function post(
+    url: string,
+    payload: unknown,
+    successStatuses: readonly number[]
+  ): Promise<PostResult> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     let response: Response
     try {
-      response = await fetchImpl(options.endpoint, {
+      response = await fetchImpl(url, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${options.token}`,
@@ -84,7 +99,7 @@ export function createSender(options: SenderOptions) {
           Accept: 'application/json',
           'User-Agent': options.userAgent ?? 'signalk-fleetai',
         },
-        body: JSON.stringify({ batchId: batch.batchId, samples: batch.samples }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
         redirect: 'manual',
       })
@@ -99,13 +114,7 @@ export function createSender(options: SenderOptions) {
     const body = await readJson(response)
     const error = typeof body?.error === 'string' ? body.error : `http_${status}`
 
-    if (status === 200) {
-      return {
-        kind: 'accepted',
-        accepted: typeof body?.accepted === 'number' ? body.accepted : 0,
-        ignored: typeof body?.ignored === 'number' ? body.ignored : 0,
-      }
-    }
+    if (successStatuses.includes(status)) return { kind: 'ok', body }
     if (status === 429 || status === 408 || status >= 500 || (status >= 300 && status < 400)) {
       return {
         kind: 'retry',
@@ -130,8 +139,50 @@ export function createSender(options: SenderOptions) {
       message: `HTTP ${status} ${error}${typeof body?.path === 'string' ? ` (${body.path})` : ''}`,
     }
   }
+}
+
+function count(body: Record<string, unknown> | null, key: string): number {
+  const value = body?.[key]
+  return typeof value === 'number' ? value : 0
+}
+
+export function createSender(options: SenderOptions) {
+  const post = createPoster(options)
+
+  async function send(batch: BatchPayload): Promise<SendOutcome> {
+    const result = await post(
+      options.endpoint,
+      { batchId: batch.batchId, samples: batch.samples },
+      [200]
+    )
+    if (result.kind !== 'ok') return result
+    return {
+      kind: 'accepted',
+      accepted: count(result.body, 'accepted'),
+      ignored: count(result.body, 'ignored'),
+    }
+  }
+
+  return { send }
+}
+
+/** `POST {inventory endpoint}` — the full device list; the server answers `201 { created, updated, gone }`. */
+export function createInventorySender(options: SenderOptions) {
+  const post = createPoster(options)
+
+  async function send(payload: InventoryPayload): Promise<InventorySendOutcome> {
+    const result = await post(options.endpoint, payload, [200, 201])
+    if (result.kind !== 'ok') return result
+    return {
+      kind: 'accepted',
+      created: count(result.body, 'created'),
+      updated: count(result.body, 'updated'),
+      gone: count(result.body, 'gone'),
+    }
+  }
 
   return { send }
 }
 
 export type Sender = ReturnType<typeof createSender>
+export type InventorySender = ReturnType<typeof createInventorySender>
