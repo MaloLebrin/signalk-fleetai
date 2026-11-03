@@ -67,12 +67,15 @@ Besides the readings, the plugin tells FleetAi **which devices feed them** (engi
 
 - **NMEA 2000** — read from the server's `sources` tree: `n2k.manufacturerName`, `productName`, `serialNumber`, `deviceFunction`, and the address (`src`).
 - **NMEA 0183** — one device per connection: its label (`NMEA 0183 ttyUSB0 (GGA, RMC)`) with the sentences seen.
-- **Fallback** — when `sources` does not carry the NMEA 2000 metadata, the plugin also listens to the server's `N2KAnalyzerOut` events for **PGN 126996** (product information) and **PGN 60928** (address claim) and fills in what is missing. The `sources` tree wins when both know a field.
+- **Fallback** — when `sources` does not carry the NMEA 2000 metadata, the plugin also listens to the server's `N2KAnalyzerOut` events for **PGN 126996** (product information) and **PGN 60928** (address claim) and fills in what is missing. The `sources` tree wins when both know a field. A PGN names no connection, so it is ignored when two NMEA 2000 connections (`can0`, `can1`) both have a device at that address. A device known only from its PGNs (no catalog path) is not announced.
+- **Settling** — a NMEA 2000 device with no manufacturer, model or serial number yet is held back for 2 minutes, waiting for its metadata, so its `deviceId` does not change when it arrives.
 - Plugin and derived-data sources (`derived-data`, …) are not devices of the boat and are left out. Alarms (`notifications.*`) are not attributed to a device. Only catalog paths are listed (≤ 64 devices, ≤ 100 paths each).
 
-**`deviceId`** is a stable fingerprint: `n2k-` + 16 hex of SHA-256 over manufacturer + model + serial number (lower-cased), so it survives an address change; `nmea0183-<connection>` for a serial/UDP connection. Two identical devices with no serial number are told apart by their address. The serial number is never part of the id.
+**`deviceId`** is a stable fingerprint: `n2k-` + 16 hex of an HMAC-SHA-256 over manufacturer + model + serial number (lower-cased), so it survives an address change; `nmea0183-<connection>` for a serial/UDP connection (a short hash is added when the connection name is not a valid id by itself). A device with no serial number is told apart from identical ones by its place on the bus (connection + address) — decided per device, so another device appearing never changes its id. The serial number is never part of the id.
 
-**Serial numbers.** Sent in clear by default (it helps tell two identical devices apart in FleetAi). With **Hide device serial numbers** ticked, `serialNumber` becomes `h:` + 8 hex of a salted SHA-256 — stable, so the device stays recognised, but not reversible to the serial number. Serial numbers are never written to the Signal K log.
+The HMAC key is a random **per-installation secret** created on first start in `plugin-config-data/signalk-fleetai/inventory-salt` (mode 600, never sent anywhere). Serial numbers are short and guessable; without that key neither the id nor the hidden serial can be recovered by enumeration, and the same device gets a different id on another boat. Deleting the file gives every device a new id (the old ones are marked gone by FleetAi).
+
+**Serial numbers.** Sent in clear by default (it helps tell two identical devices apart in FleetAi). With **Hide device serial numbers** ticked, `serialNumber` becomes `h:` + 8 hex of the same keyed hash — stable, so the device stays recognised, but not reversible to the serial number. Serial numbers are never written to the Signal K log.
 
 **When.** `POST <endpoint>/inventory` — i.e. `https://fleetai.app/api/instruments/inventory` for the default endpoint (`/ingest` is replaced by `/inventory`) — with the same `Authorization: Bearer fai_ing_…` token as the readings:
 
@@ -80,7 +83,7 @@ Besides the readings, the plugin tells FleetAi **which devices feed them** (engi
 - **at most once a minute**, the change being checked every 15 s;
 - the body is the **complete state** (`{ "devices": [...] }`), FleetAi marking a missing device as gone after its own 10-minute grace.
 
-Answers follow the batch rules: `201 { created, updated, gone }`; `401` / `403` / `404` / `409` stop the plugin with a visible error; `429` waits for `Retry-After`, network errors and `5xx` back off from 1 min (cap 5 min) and resend the current state; `422` is logged (error code only, never the device list) and the same list is not sent again until it changes.
+Answers: `201 { created, updated, gone }`; `401` / `403` / `404` / `409` switch **the inventory only** off until the next start (logged once; the inventory is a secondary feature — an older FleetAi without the route must not stop your readings — and a really revoked token is caught by the next batch, which stops the plugin as usual); `429` waits for `Retry-After`, network errors and `5xx` back off from 1 min (cap 5 min) and resend the current state; `422` is logged (error code only, never the device list) and the same list is not sent again until it changes.
 
 Example body:
 

@@ -4,12 +4,14 @@ import { CONFIG_SCHEMA, CONFIG_UI_SCHEMA, resolveConfig } from './config'
 import { createInventoryTracker } from './inventory'
 import { createInventorySync } from './inventory_sync'
 import { createRuntime, type Runtime } from './runtime'
+import { loadSalt } from './salt'
 import { createInventorySender, createSender } from './sender'
 import { aisSubscriptions, selfSubscriptions, type SubscriptionEntry } from './subscriptions'
 import type { Delta } from './types'
 
 const PLUGIN_ID = 'signalk-fleetai'
 const QUEUE_FILE = 'queue.json'
+const SALT_FILE = 'inventory-salt'
 /** How often the inventory is re-evaluated; the once-a-minute send limit lives in the sync. */
 const INVENTORY_CHECK_MS = 15_000
 /** Raw NMEA 2000 messages decoded by the server (canboat), used when `sources` lacks metadata. */
@@ -93,6 +95,7 @@ export function createPlugin(app: ServerAPI): Plugin {
       const tracker = createInventoryTracker({
         selfContext,
         hideSerialNumbers: config.hideSerialNumbers,
+        salt: loadSalt(join(app.getDataDirPath(), SALT_FILE), (message) => app.error(message)),
         readSources: () => app.getPath('sources'),
       })
       const inventorySync = createInventorySync({
@@ -105,7 +108,7 @@ export function createPlugin(app: ServerAPI): Plugin {
         }),
       })
 
-      runtime = createRuntime({
+      const active: Runtime = createRuntime({
         config,
         inventory: { tracker, sync: inventorySync },
         selfContext,
@@ -120,9 +123,12 @@ export function createPlugin(app: ServerAPI): Plugin {
           setStatus: (message) => app.setPluginStatus(message),
           setError: (message) => app.setPluginError(message),
         },
-        onFatal: () => teardown(),
+        // A late answer of a previous run must not tear down the one running now.
+        onFatal: () => {
+          if (runtime === active) teardown()
+        },
       })
-      const active = runtime
+      runtime = active
 
       const onDelta = (delta: Delta) => active.handleDelta(delta)
       const onError = (error: unknown) => app.error(`subscription error: ${String(error)}`)

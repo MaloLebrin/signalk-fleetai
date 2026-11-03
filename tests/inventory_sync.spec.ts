@@ -6,7 +6,7 @@ import {
   MIN_SEND_INTERVAL_MS,
 } from '../src/inventory_sync'
 import { createInventorySender, type FetchLike } from '../src/sender'
-import { BOAT_DELTAS, sourceDelta, sourcesTree } from './helpers/inventory'
+import { BOAT_DELTAS, SALT, sourceDelta, sourcesTree } from './helpers/inventory'
 import { SELF, T0 } from './helpers/runtime'
 
 type Step = { status: number; body?: unknown; headers?: Record<string, string> } | Error
@@ -26,6 +26,7 @@ function setup(script: Step[] = [{ status: 201, body: { created: 1, updated: 0, 
   const tracker = createInventoryTracker({
     selfContext: SELF,
     hideSerialNumbers: false,
+    salt: SALT,
     readSources: () => sourcesTree(),
   })
   const logs: string[] = []
@@ -181,6 +182,18 @@ describe('inventory sync — answers', () => {
     tracker.observeDelta(BOAT_DELTAS[0]!, clock.now)
     const result = await sync.run()
     expect(result).toMatchObject({ kind: 'fatal', outcome: { status, error } })
+  })
+
+  it('stays off for the session after a fatal answer (reported once)', async () => {
+    const { sync, calls, tracker, clock } = setup([
+      { status: 404, body: { error: 'source_not_found' } },
+    ])
+    tracker.observeDelta(BOAT_DELTAS[0]!, clock.now)
+    expect((await sync.run()).kind).toBe('fatal')
+    clock.now += 10 * MIN_SEND_INTERVAL_MS
+    tracker.observeDelta(BOAT_DELTAS[1]!, clock.now)
+    expect(await sync.run()).toEqual({ kind: 'idle' })
+    expect(calls).toHaveLength(1)
   })
 
   it('a refused inventory (422) is logged without its content and not resent until it changes', async () => {

@@ -7,8 +7,12 @@ import type { InventorySender, InventorySendOutcome } from './sender'
  * more than once a minute. The body is always the full state.
  *
  * Failures follow the batch rules: network / 5xx / 429 back off and retry the
- * same state, 401/403/404/409 are reported to the caller (the plugin stops),
- * and a refused state (422) is not sent again until it changes.
+ * same state, and a refused state (422) is not sent again until it changes.
+ *
+ * A fatal answer (401/403/404/409) switches **only the inventory** off for the
+ * session: it is a secondary feature (an older FleetAi without the route, a
+ * token that lacks it…) and must never stop the readings. A genuinely revoked
+ * token is caught by the next batch, which stops the plugin as usual.
  */
 
 export const MIN_SEND_INTERVAL_MS = 60_000
@@ -40,9 +44,10 @@ export function createInventorySync(options: InventorySyncOptions) {
   let nextAttemptAtMs: number | null = null
   let backoffMs = INVENTORY_INITIAL_BACKOFF_MS
   let sending = false
+  let disabled = false
 
   async function run(): Promise<InventorySyncResult> {
-    if (sending) return { kind: 'idle' }
+    if (sending || disabled) return { kind: 'idle' }
     const atMs = now()
     const { payload, signature } = tracker.snapshot(atMs)
 
@@ -83,6 +88,8 @@ export function createInventorySync(options: InventorySyncOptions) {
           return { kind: 'deferred', message: outcome.message }
         }
         case 'fatal':
+          // Reported once; the inventory then stays off for this session.
+          disabled = true
           return { kind: 'fatal', outcome }
         case 'drop':
           refusedSignature = signature

@@ -6,7 +6,7 @@ import {
   type InventoryDevice,
   type InventoryPayload,
 } from '../src/inventory'
-import { BOAT_DELTAS, sourcesTree } from './helpers/inventory'
+import { BOAT_DELTAS, SALT, sourcesTree } from './helpers/inventory'
 import { SELF, T0 } from './helpers/runtime'
 
 /**
@@ -90,6 +90,7 @@ function build(hide: boolean): InventoryPayload {
   const tracker = createInventoryTracker({
     selfContext: SELF,
     hideSerialNumbers: hide,
+    salt: SALT,
     readSources: () => sourcesTree(),
   })
   for (const delta of BOAT_DELTAS) tracker.observeDelta(delta, T0)

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { AIS_PATH_PREFIX, catalogSpec } from './catalog'
 import { isSelfDelta } from './normalizer'
 import type { Delta } from './types'
@@ -10,9 +10,9 @@ import type { Delta } from './types'
  * are handed in by the plugin.
  *
  * Presence is **observed activity**: a device exists while one of its deltas
- * (catalog path) or one of its PGN 126996 / 60928 was seen in the last ten
- * minutes. The `sources` tree only supplies metadata, because it also lists
- * every device ever seen on the bus.
+ * (catalog path) was seen in the last ten minutes. The `sources` tree and the
+ * PGNs 126996 / 60928 only supply metadata — the tree also lists every device
+ * ever seen on the bus, and a PGN carries no connection name.
  */
 
 export type InventoryBus = 'n2k' | 'nmea0183' | 'other'
@@ -41,6 +41,10 @@ export const MAX_DEVICES = 64
 export const MAX_PATHS_PER_DEVICE = 100
 export const TEXT_MAX_LENGTH = 120
 export const DEVICE_ID_MAX_LENGTH = 64
+/** A device without any identity is held back this long, waiting for its metadata (stable `deviceId`). */
+export const IDENTITY_SETTLE_MS = 2 * 60_000
+/** The `sources` tree is re-read at most this often on the delta path. */
+export const SOURCES_CACHE_MS = 5_000
 
 export interface InventorySnapshot {
   payload: InventoryPayload
@@ -54,6 +58,11 @@ export interface InventoryTrackerOptions {
   readSources: () => unknown
   /** Send a hash of the serial number instead of the serial number itself. */
   hideSerialNumbers: boolean
+  /**
+   * Secret, per installation (see `loadSalt`): keys the hashes so that a serial
+   * number cannot be recovered by enumeration nor correlated between boats.
+   */
+  salt: string
 }
 
 interface Metadata {
@@ -71,6 +80,7 @@ interface Observed {
   src: number | null
   sentences: Set<string>
   paths: Set<string>
+  firstSeenMs: number
   lastSeenMs: number
 }
 
@@ -84,16 +94,29 @@ function isRecord(value: unknown): value is Tree {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Printable single-line text FleetAi accepts (`PLAIN_TEXT`: no control or format characters). */
+/** Cuts at `max` UTF-16 units (what FleetAi counts) without splitting a surrogate pair. */
+function truncate(text: string, max: number): string {
+  let length = 0
+  let out = ''
+  for (const char of text) {
+    if (length + char.length > max) break
+    out += char
+    length += char.length
+  }
+  return out
+}
+
+/** Printable single-line text FleetAi accepts (`PLAIN_TEXT`: no control, format or lone-surrogate characters). */
 export function cleanText(value: unknown): string | null {
   const raw = typeof value === 'number' && Number.isFinite(value) ? String(value) : value
   if (typeof raw !== 'string') return null
-  const text = raw
-    .replace(/[\p{Cc}\p{Cf}]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, TEXT_MAX_LENGTH)
-    .trim()
+  const text = truncate(
+    raw
+      .replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim(),
+    TEXT_MAX_LENGTH
+  ).trim()
   return text === '' ? null : text
 }
 
@@ -116,32 +139,55 @@ function sha256Hex(input: string): string {
   return createHash('sha256').update(input).digest('hex')
 }
 
-/** `h:` + 8 hex of a salted hash — what is sent instead of the serial number when it is hidden. */
-export function hashSerial(serial: string): string {
-  return `h:${sha256Hex(`serial|${serial.trim().toLowerCase()}`).slice(0, 8)}`
+function hmacHex(salt: string, input: string): string {
+  return createHmac('sha256', salt).update(input).digest('hex')
+}
+
+/** `h:` + 8 hex of a keyed hash — what is sent instead of the serial number when it is hidden. */
+export function hashSerial(serial: string, salt: string): string {
+  return `h:${hmacHex(salt, `serial|${serial.trim().toLowerCase()}`).slice(0, 8)}`
 }
 
 /**
  * Stable fingerprint of a NMEA 2000 device: manufacturer + model + serial,
- * hashed (16 hex), so the id survives an address change and never contains
- * the serial in clear. Without any identity, the connection and address stand in.
+ * keyed-hashed (16 hex), so the id survives an address change and cannot be
+ * turned back into the serial number. Without a serial number nothing tells
+ * two identical devices apart but their place on the bus, so `placeOnBus`
+ * (connection + address) joins the hash — decided per device, never by looking
+ * at the others, so one device appearing never changes another's id.
  */
-export function n2kDeviceId(identity: {
-  manufacturer: string | null
-  model: string | null
-  serialNumber: string | null
-  fallback: string
-}): string {
-  const parts = [identity.manufacturer, identity.model, identity.serialNumber].map((part) =>
-    (part ?? '').trim().toLowerCase()
-  )
-  const material = parts.every((part) => part === '') ? identity.fallback : parts.join('|')
-  return `n2k-${sha256Hex(`n2k|${material}`).slice(0, 16)}`
+export function n2kDeviceId(
+  identity: {
+    manufacturer: string | null
+    model: string | null
+    serialNumber: string | null
+    placeOnBus: string
+  },
+  salt: string,
+  forcePlace = false
+): string {
+  const [manufacturer, model, serial] = [
+    identity.manufacturer,
+    identity.model,
+    identity.serialNumber,
+  ].map((part) => (part ?? '').trim().toLowerCase())
+  const material = [manufacturer, model, serial]
+  if (serial === '' || forcePlace) material.push(`@${identity.placeOnBus}`)
+  return `n2k-${hmacHex(salt, `n2k|${material.join('|')}`).slice(0, 16)}`
 }
 
-function slug(value: string): string {
-  const cleaned = value.replace(/[^0-9A-Za-z_.-]+/g, '-').replace(/^[^0-9A-Za-z]+/, '')
-  return cleaned.slice(0, DEVICE_ID_MAX_LENGTH - 'nmea0183-'.length) || sha256Hex(value).slice(0, 8)
+/** Readable when the connection name is already a valid id, otherwise slugged + short hash (no collision). */
+export function nmea0183DeviceId(connection: string): string {
+  const prefix = 'nmea0183-'
+  const room = DEVICE_ID_MAX_LENGTH - prefix.length
+  if (connection.length <= room && /^[0-9A-Za-z][0-9A-Za-z_.-]*$/.test(connection)) {
+    return `${prefix}${connection}`
+  }
+  const readable = connection
+    .replace(/[^0-9A-Za-z_.-]+/g, '-')
+    .replace(/^[^0-9A-Za-z]+/, '')
+    .slice(0, room - 9)
+  return `${prefix}${readable === '' ? 'x' : readable}-${sha256Hex(connection).slice(0, 8)}`
 }
 
 function parseAddress(value: unknown): number | null {
@@ -162,19 +208,26 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
   const observed = new Map<string, Observed>()
   const pgn = new Map<number, PgnInfo>()
 
-  function readTree(): Tree {
+  let cachedTree: Tree = {}
+  let cachedAtMs = -Infinity
+
+  /** The `sources` tree, re-read at most every few seconds: it is walked on the delta hot path. */
+  function readTree(atMs: number): Tree {
+    if (atMs - cachedAtMs < SOURCES_CACHE_MS && atMs >= cachedAtMs) return cachedTree
+    cachedAtMs = atMs
     try {
       const tree = options.readSources()
-      return isRecord(tree) ? tree : {}
+      cachedTree = isRecord(tree) ? tree : {}
     } catch {
-      return {}
+      cachedTree = {}
     }
+    return cachedTree
   }
 
   /** Which bus a delta source belongs to, from the delta itself then from the `sources` tree. */
   function resolveSource(
     update: NonNullable<Delta['updates']>[number],
-    tree: Tree
+    tree: () => Tree
   ): { bus: InventoryBus; connection: string; src: number | null; sentence: string | null } | null {
     const object = isRecord(update.source) ? update.source : null
     let connection: string | null = null
@@ -192,16 +245,19 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
 
     const sentence = object && typeof object.sentence === 'string' ? object.sentence : null
     const declared = object && typeof object.type === 'string' ? object.type.toUpperCase() : null
-    const node = tree[connection]
-    const child = isRecord(node) && rest !== null ? node[rest] : undefined
-    const treeType =
-      isRecord(node) && typeof node.type === 'string' ? node.type.toUpperCase() : null
-
     let bus: InventoryBus | null = null
-    if (declared === 'NMEA2000' || treeType === 'NMEA2000') bus = 'n2k'
-    else if (declared === 'NMEA0183' || treeType === 'NMEA0183') bus = 'nmea0183'
-    else if (isRecord(child) && isRecord(child.n2k)) bus = 'n2k'
-    else if (isRecord(child) && isRecord(child.sentences)) bus = 'nmea0183'
+    // The delta says what it is: the tree is not needed.
+    if (declared === 'NMEA2000') bus = 'n2k'
+    else if (declared === 'NMEA0183') bus = 'nmea0183'
+    else {
+      const node = child(tree(), connection)
+      const treeType = node && typeof node.type === 'string' ? node.type.toUpperCase() : null
+      const member = child(node, rest)
+      if (treeType === 'NMEA2000') bus = 'n2k'
+      else if (treeType === 'NMEA0183') bus = 'nmea0183'
+      else if (member && isRecord(member.n2k)) bus = 'n2k'
+      else if (member && isRecord(member.sentences)) bus = 'nmea0183'
+    }
     // Plugins, derived data, WebSocket clients… are not devices of the boat.
     if (bus === null) return null
 
@@ -228,12 +284,10 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
 
   function observeDelta(delta: Delta, atMs: number) {
     if (!isSelfDelta(delta, options.selfContext)) return
-    let tree: Tree | null = null
     for (const update of delta.updates ?? []) {
       const paths = catalogPaths(update)
       if (paths.length === 0) continue
-      tree ??= readTree()
-      const source = resolveSource(update, tree)
+      const source = resolveSource(update, () => readTree(atMs))
       if (source === null) continue
       const key =
         source.bus === 'n2k'
@@ -248,6 +302,7 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
           src: source.src,
           sentences: new Set(),
           paths: new Set(),
+          firstSeenMs: atMs,
           lastSeenMs: atMs,
         }
         observed.set(key, device)
@@ -286,9 +341,22 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
     pgn.set(src, info)
   }
 
-  function n2kMetadata(connection: string | null, src: number, tree: Tree): Metadata {
+  /** How many N2K connections have a device at `src` (observed or listed in the tree). */
+  function connectionsAt(src: number, tree: Tree): number {
+    const connections = new Set<string>()
+    for (const device of observed.values()) {
+      if (device.bus === 'n2k' && device.src === src) connections.add(device.connection)
+    }
+    for (const [name, node] of Object.entries(tree)) {
+      if (isRecord(node) && isRecord(child(node, String(src))?.n2k)) connections.add(name)
+    }
+    return connections.size
+  }
+
+  function n2kMetadata(connection: string, src: number, tree: Tree): Metadata {
     const n2k = child(child(child(tree, connection), String(src)), 'n2k')
-    const fromPgn = pgn.get(src)
+    // A PGN names no connection: it only completes a device when the address is unambiguous.
+    const fromPgn = connectionsAt(src, tree) <= 1 ? pgn.get(src) : undefined
     return {
       manufacturer:
         firstText(n2k, 'manufacturerName', 'manufacturer', 'manufacturerCode') ??
@@ -316,6 +384,40 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
     return [...sentences].sort()
   }
 
+  interface Draft {
+    device: Omit<InventoryDevice, 'deviceId'>
+    lastSeenMs: number
+    /** `null` for NMEA 0183 (the id comes from the connection name). */
+    identity: (Metadata & { placeOnBus: string }) | null
+    fixedId: string | null
+  }
+
+  function n2kDraft(device: Observed, tree: Tree): Draft {
+    const src = device.src!
+    const meta = n2kMetadata(device.connection, src, tree)
+    const name = cleanText([meta.manufacturer, meta.model].filter(Boolean).join(' '))
+    const entry: Omit<InventoryDevice, 'deviceId'> = {
+      label: name ?? `NMEA 2000 device ${src}`,
+      bus: 'n2k',
+      address: src,
+      paths: [...device.paths],
+    }
+    if (meta.manufacturer !== null) entry.manufacturer = meta.manufacturer
+    if (meta.model !== null) entry.model = meta.model
+    if (meta.serialNumber !== null) {
+      entry.serialNumber = options.hideSerialNumbers
+        ? hashSerial(meta.serialNumber, options.salt)
+        : meta.serialNumber
+    }
+    if (meta.function !== null) entry.function = meta.function
+    return {
+      device: entry,
+      lastSeenMs: device.lastSeenMs,
+      identity: { ...meta, placeOnBus: `${device.connection}@${src}` },
+      fixedId: null,
+    }
+  }
+
   function toPayload(atMs: number): InventoryDevice[] {
     for (const [key, device] of observed) {
       if (atMs - device.lastSeenMs > DEVICE_GONE_AFTER_MS) observed.delete(key)
@@ -323,72 +425,45 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
     for (const [src, info] of pgn) {
       if (atMs - info.lastSeenMs > DEVICE_GONE_AFTER_MS) pgn.delete(src)
     }
-    const tree = readTree()
+    const tree = readTree(atMs)
 
-    interface Draft {
-      device: Omit<InventoryDevice, 'deviceId'>
-      lastSeenMs: number
-      identity: Metadata
-      fallback: string
-      fixedId: string | null
-    }
     const drafts: Draft[] = []
-    const coveredAddresses = new Set<number>()
-
     for (const device of observed.values()) {
       if (device.bus === 'n2k' && device.src !== null) {
-        coveredAddresses.add(device.src)
-        // A PGN seen recently also proves the device is alive.
-        const lastSeenMs = Math.max(device.lastSeenMs, pgn.get(device.src)?.lastSeenMs ?? 0)
-        drafts.push(n2kDraft(device.connection, device.src, tree, [...device.paths], lastSeenMs))
+        const draft = n2kDraft(device, tree)
+        const known = draft.identity!
+        const hasIdentity =
+          known.manufacturer !== null || known.model !== null || known.serialNumber !== null
+        // Its id would change when the metadata arrives: wait a little for it.
+        if (!hasIdentity && atMs - device.firstSeenMs < IDENTITY_SETTLE_MS) continue
+        drafts.push(draft)
       } else if (device.bus === 'nmea0183') {
         const sentences = sentencesOf(device, tree)
         const label = cleanText(
           `NMEA 0183 ${device.connection}${sentences.length > 0 ? ` (${sentences.join(', ')})` : ''}`
         )
         drafts.push({
-          device: {
-            label: label ?? 'NMEA 0183',
-            bus: 'nmea0183',
-            paths: [...device.paths],
-          },
+          device: { label: label ?? 'NMEA 0183', bus: 'nmea0183', paths: [...device.paths] },
           lastSeenMs: device.lastSeenMs,
-          identity: { manufacturer: null, model: null, serialNumber: null, function: null },
-          fallback: '',
-          fixedId: `nmea0183-${slug(device.connection)}`,
+          identity: null,
+          fixedId: nmea0183DeviceId(device.connection),
         })
       }
     }
-    // Devices only known by their PGNs (no catalog delta seen yet): still announced.
-    for (const [src, info] of pgn) {
-      if (coveredAddresses.has(src)) continue
-      drafts.push(n2kDraft(null, src, tree, [], info.lastSeenMs))
-    }
-
-    // Two identical, serial-less devices must not share an id (`duplicate_device`).
-    const counts = new Map<string, number>()
-    const baseIds = drafts.map(
-      (draft) => draft.fixedId ?? n2kDeviceId({ ...draft.identity, fallback: draft.fallback })
-    )
-    for (const id of baseIds) counts.set(id, (counts.get(id) ?? 0) + 1)
 
     const devices: Array<{ device: InventoryDevice; lastSeenMs: number }> = []
     const used = new Set<string>()
-    drafts.forEach((draft, index) => {
-      let deviceId = baseIds[index]!
-      if ((counts.get(deviceId) ?? 0) > 1 && draft.fixedId === null) {
-        deviceId = n2kDeviceId({
-          ...draft.identity,
-          fallback: draft.fallback,
-          // The address is the only thing telling them apart.
-          serialNumber: `${draft.identity.serialNumber ?? ''}@${draft.device.address ?? draft.fallback}`,
-        })
+    for (const draft of drafts) {
+      let deviceId = draft.fixedId ?? n2kDeviceId(draft.identity!, options.salt)
+      // Same manufacturer + model + serial twice: only the place on the bus tells them apart.
+      if (used.has(deviceId) && draft.identity) {
+        deviceId = n2kDeviceId(draft.identity, options.salt, true)
       }
-      if (used.has(deviceId)) return
+      if (used.has(deviceId)) continue // unreachable in practice; never send a duplicate_device
       used.add(deviceId)
       const paths = [...new Set(draft.device.paths)].sort().slice(0, MAX_PATHS_PER_DEVICE)
       devices.push({ device: { deviceId, ...draft.device, paths }, lastSeenMs: draft.lastSeenMs })
-    })
+    }
 
     return devices
       .sort(
@@ -397,38 +472,6 @@ export function createInventoryTracker(options: InventoryTrackerOptions) {
       .slice(0, MAX_DEVICES)
       .map(({ device }) => device)
       .sort((a, b) => a.deviceId.localeCompare(b.deviceId))
-  }
-
-  function n2kDraft(
-    connection: string | null,
-    src: number,
-    tree: Tree,
-    paths: string[],
-    lastSeenMs: number
-  ) {
-    const meta = n2kMetadata(connection, src, tree)
-    const name = cleanText([meta.manufacturer, meta.model].filter(Boolean).join(' '))
-    const device: Omit<InventoryDevice, 'deviceId'> = {
-      label: name ?? `NMEA 2000 device ${src}`,
-      bus: 'n2k',
-      address: src,
-      paths,
-    }
-    if (meta.manufacturer !== null) device.manufacturer = meta.manufacturer
-    if (meta.model !== null) device.model = meta.model
-    if (meta.serialNumber !== null) {
-      device.serialNumber = options.hideSerialNumbers
-        ? hashSerial(meta.serialNumber)
-        : meta.serialNumber
-    }
-    if (meta.function !== null) device.function = meta.function
-    return {
-      device,
-      lastSeenMs,
-      identity: meta,
-      fallback: `${connection ?? ''}@${src}`,
-      fixedId: null as string | null,
-    }
   }
 
   function snapshot(atMs: number): InventorySnapshot {

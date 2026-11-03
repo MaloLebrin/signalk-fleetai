@@ -1,19 +1,24 @@
 import { describe, expect, it } from 'vitest'
 import {
+  cleanText,
   createInventoryTracker,
   DEVICE_GONE_AFTER_MS,
   hashSerial,
+  IDENTITY_SETTLE_MS,
+  nmea0183DeviceId,
+  SOURCES_CACHE_MS,
   MAX_DEVICES,
   MAX_PATHS_PER_DEVICE,
   n2kDeviceId,
   type InventoryDevice,
 } from '../src/inventory'
-import { BOAT_DELTAS, sourceDelta, sourcesTree } from './helpers/inventory'
+import { BOAT_DELTAS, SALT, sourceDelta, sourcesTree } from './helpers/inventory'
 import { SELF, T0 } from './helpers/runtime'
 
-function tracker(options: { hide?: boolean; sources?: unknown } = {}) {
+function tracker(options: { hide?: boolean; sources?: unknown; salt?: string } = {}) {
   return createInventoryTracker({
     selfContext: SELF,
+    salt: options.salt ?? SALT,
     hideSerialNumbers: options.hide ?? false,
     readSources: () => options.sources ?? sourcesTree(),
   })
@@ -103,7 +108,10 @@ describe('inventory — building from the sources tree', () => {
   it('keeps announcing a device whose metadata is missing, by address', () => {
     const t = tracker({ sources: { can0: { type: 'NMEA2000' } } })
     t.observeDelta(sourceDelta('can0.77', { 'navigation.log': 1 }), T0)
-    const [device] = t.snapshot(T0).payload.devices
+    // No identity yet: held back, its id would change when the metadata arrives.
+    expect(t.snapshot(T0 + IDENTITY_SETTLE_MS - 1).payload.devices).toEqual([])
+    t.observeDelta(sourceDelta('can0.77', { 'navigation.log': 2 }), T0 + IDENTITY_SETTLE_MS)
+    const [device] = t.snapshot(T0 + IDENTITY_SETTLE_MS).payload.devices
     expect(device).toMatchObject({ label: 'NMEA 2000 device 77', bus: 'n2k', address: 77 })
     expect(device!.deviceId).toMatch(/^n2k-[0-9a-f]{16}$/)
   })
@@ -111,6 +119,7 @@ describe('inventory — building from the sources tree', () => {
   it('survives a broken or throwing sources reader', () => {
     const t = createInventoryTracker({
       selfContext: SELF,
+      salt: SALT,
       hideSerialNumbers: false,
       readSources: () => {
         throw new Error('boom')
@@ -157,12 +166,10 @@ describe('inventory — device id and serial number', () => {
     expect(idA).toMatch(/^n2k-[0-9a-f]{16}$/)
     expect(moved.snapshot(T0).payload.devices[0]!.deviceId).toBe(idA)
     expect(idA).toBe(
-      n2kDeviceId({
-        manufacturer: 'Volvo Penta',
-        model: 'EVC',
-        serialNumber: 'SN-0042',
-        fallback: '',
-      })
+      n2kDeviceId(
+        { manufacturer: 'Volvo Penta', model: 'EVC', serialNumber: 'SN-0042', placeOnBus: '' },
+        SALT
+      )
     )
   })
 
@@ -188,7 +195,7 @@ describe('inventory — device id and serial number', () => {
     for (const delta of BOAT_DELTAS) t.observeDelta(delta, T0)
     const { payload, signature } = t.snapshot(T0)
     const engine = byAddress(payload.devices, 12)
-    expect(engine.serialNumber).toBe(hashSerial('SN-0042'))
+    expect(engine.serialNumber).toBe(hashSerial('SN-0042', SALT))
     expect(engine.serialNumber).toMatch(/^h:[0-9a-f]{8}$/)
     expect(signature).not.toContain('SN-0042')
     expect(signature).not.toContain('HQ2100AB')
@@ -199,8 +206,8 @@ describe('inventory — device id and serial number', () => {
   })
 
   it('hashes the same serial the same way, and different serials differently', () => {
-    expect(hashSerial('SN-0042')).toBe(hashSerial(' sn-0042 '))
-    expect(hashSerial('SN-0042')).not.toBe(hashSerial('SN-0043'))
+    expect(hashSerial('SN-0042', SALT)).toBe(hashSerial(' sn-0042 ', SALT))
+    expect(hashSerial('SN-0042', SALT)).not.toBe(hashSerial('SN-0043', SALT))
   })
 
   it('tells two identical serial-less devices apart (no duplicate_device)', () => {
@@ -217,6 +224,130 @@ describe('inventory — device id and serial number', () => {
     t.observeDelta(sourceDelta('can0.11', { 'propulsion.starboard.runTime': 1 }), T0)
     const ids = t.snapshot(T0).payload.devices.map((d) => d.deviceId)
     expect(new Set(ids).size).toBe(2)
+  })
+})
+
+describe('inventory — id stability, salt, hot path', () => {
+  it('keys the ids and serial hashes with the installation salt', () => {
+    const a = tracker({ hide: true, salt: 'a'.repeat(32) })
+    const b = tracker({ hide: true, salt: 'b'.repeat(32) })
+    a.observeDelta(BOAT_DELTAS[0]!, T0)
+    b.observeDelta(BOAT_DELTAS[0]!, T0)
+    const [da] = a.snapshot(T0).payload.devices
+    const [db] = b.snapshot(T0).payload.devices
+    expect(da!.deviceId).not.toBe(db!.deviceId)
+    expect(da!.serialNumber).not.toBe(db!.serialNumber)
+    // Not a plain hash anyone could compute from a guessed serial number.
+    expect(da!.serialNumber).not.toBe(hashSerial('SN-0042', ''))
+    // The same salt gives the same ids (after a restart).
+    const again = tracker({ hide: true, salt: 'a'.repeat(32) })
+    again.observeDelta(BOAT_DELTAS[0]!, T0)
+    expect(again.snapshot(T0).payload.devices[0]!.deviceId).toBe(da!.deviceId)
+  })
+
+  it("a second identical serial-less device does not change the first one's id", () => {
+    const tree = {
+      can0: {
+        type: 'NMEA2000',
+        '10': { n2k: { manufacturerName: 'Yanmar', productName: 'Gateway' } },
+        '11': { n2k: { manufacturerName: 'Yanmar', productName: 'Gateway' } },
+      },
+    }
+    const t = tracker({ sources: tree })
+    t.observeDelta(sourceDelta('can0.10', { 'propulsion.port.runTime': 1 }), T0)
+    const before = t.snapshot(T0).payload.devices[0]!.deviceId
+    t.observeDelta(sourceDelta('can0.11', { 'propulsion.starboard.runTime': 1 }), T0 + 1)
+    const after = t.snapshot(T0 + 1).payload.devices.find((d) => d.address === 10)!.deviceId
+    expect(after).toBe(before)
+  })
+
+  it('two devices with the same manufacturer, model and serial both get an id', () => {
+    const entry = { n2k: { manufacturerName: 'Acme', productName: 'X', serialNumber: '1' } }
+    const t = tracker({ sources: { can0: { type: 'NMEA2000', '1': entry, '2': entry } } })
+    t.observeDelta(sourceDelta('can0.1', { 'navigation.log': 1 }), T0)
+    t.observeDelta(sourceDelta('can0.2', { 'navigation.log': 1 }), T0)
+    expect(t.snapshot(T0).payload.devices).toHaveLength(2)
+  })
+
+  it('gives different NMEA 0183 connections different ids, even when their slugs collide', () => {
+    const ids = [
+      'serial a',
+      'serial-a',
+      '/dev/ttyUSB0',
+      'dev-ttyUSB0',
+      'x'.repeat(80),
+      'x'.repeat(81),
+    ].map(nmea0183DeviceId)
+    expect(new Set(ids).size).toBe(ids.length)
+    for (const id of ids) {
+      expect(id).toMatch(/^[0-9A-Za-z][0-9A-Za-z_:.-]*$/)
+      expect(id.length).toBeLessThanOrEqual(64)
+    }
+    expect(nmea0183DeviceId('ttyUSB0')).toBe('nmea0183-ttyUSB0')
+
+    const t = tracker({ sources: {} })
+    for (const name of ['serial a', 'serial-a']) {
+      t.observeDelta(
+        {
+          context: SELF,
+          updates: [
+            {
+              source: { label: name, type: 'NMEA0183', talker: 'GP', sentence: 'GGA' },
+              values: [{ path: 'navigation.speedOverGround', value: 1 }],
+            },
+          ],
+        },
+        T0
+      )
+    }
+    expect(t.snapshot(T0).payload.devices).toHaveLength(2)
+  })
+
+  it('never cuts a surrogate pair in half, nor leaves a lone surrogate', () => {
+    const emoji = '\u{1F6A4}' // two UTF-16 units
+    const tooLong = 'a'.repeat(119) + emoji
+    const text = cleanText(tooLong)!
+    expect(text).toBe('a'.repeat(119))
+    expect(text.length).toBeLessThanOrEqual(120)
+    expect(cleanText('ok' + emoji)).toBe('ok' + emoji)
+    expect(cleanText('x\uD83Dy')).toBe('x y') // lone high surrogate
+    expect(cleanText('a'.repeat(118) + emoji)!.length).toBe(120)
+  })
+
+  it('reads the sources tree lazily and at most every few seconds on the delta path', () => {
+    let reads = 0
+    const t = createInventoryTracker({
+      selfContext: SELF,
+      salt: SALT,
+      hideSerialNumbers: false,
+      readSources: () => {
+        reads += 1
+        return sourcesTree()
+      },
+    })
+    // The delta declares its bus: the tree is not needed at all.
+    for (let i = 0; i < 50; i += 1) {
+      t.observeDelta(
+        {
+          context: SELF,
+          updates: [
+            {
+              $source: 'can0.12',
+              source: { label: 'can0', type: 'NMEA2000', src: '12' },
+              values: [{ path: 'navigation.log', value: i }],
+            },
+          ],
+        },
+        T0 + i
+      )
+    }
+    expect(reads).toBe(0)
+
+    // Otherwise it is read once per cache window, however many deltas arrive.
+    for (let i = 0; i < 200; i += 1) t.observeDelta(BOAT_DELTAS[0]!, T0 + i * 10)
+    expect(reads).toBe(1)
+    t.observeDelta(BOAT_DELTAS[0]!, T0 + SOURCES_CACHE_MS + 1)
+    expect(reads).toBe(2)
   })
 })
 
@@ -248,23 +379,34 @@ describe('inventory — fallback on PGN 126996 / 60928', () => {
     })
   })
 
-  it('announces a device known only by its PGNs, with no path yet', () => {
+  it('does not announce a device known only by its PGNs (no catalog path, not an instrument source)', () => {
     const t = tracker({ sources: {} })
     t.observePgn(productInfo(41), T0)
     t.observePgn(addressClaim(41), T0)
-    expect(t.snapshot(T0).payload.devices).toMatchObject([
-      { model: 'TLM100', bus: 'n2k', address: 41, paths: [] },
-    ])
+    expect(t.snapshot(T0 + IDENTITY_SETTLE_MS).payload.devices).toEqual([])
+  })
+
+  it('ignores PGN metadata when two N2K connections have a device at that address', () => {
+    const t = tracker({ sources: { can0: { type: 'NMEA2000' }, can1: { type: 'NMEA2000' } } })
+    t.observeDelta(sourceDelta('can0.22', { 'navigation.log': 1 }), T0)
+    t.observeDelta(sourceDelta('can1.22', { 'navigation.log': 2 }), T0)
+    t.observePgn(productInfo(22), T0) // which bus? a PGN does not say
+    const later = T0 + IDENTITY_SETTLE_MS
+    const { devices } = t.snapshot(later).payload
+    expect(devices).toHaveLength(2)
+    expect(devices.every((d) => d.model === undefined)).toBe(true)
+    expect(new Set(devices.map((d) => d.deviceId)).size).toBe(2)
   })
 
   it('hides a PGN serial number too, and accepts snake/camel field spellings', () => {
-    const t = tracker({ hide: true, sources: {} })
+    const t = tracker({ hide: true, sources: { can0: { type: 'NMEA2000' } } })
+    t.observeDelta(sourceDelta('can0.3', { 'navigation.log': 1 }), T0)
     t.observePgn(
       { pgn: 126996, src: 3, fields: { modelId: 'X1', model_serial_code: 'SECRET' } },
       T0
     )
     const [device] = t.snapshot(T0).payload.devices
-    expect(device).toMatchObject({ model: 'X1', serialNumber: hashSerial('SECRET') })
+    expect(device).toMatchObject({ model: 'X1', serialNumber: hashSerial('SECRET', SALT) })
     expect(JSON.stringify(device)).not.toContain('SECRET')
   })
 
@@ -334,7 +476,7 @@ describe('inventory — appearance, disappearance, limits', () => {
     for (let i = 0; i < 150; i += 1) values[`electrical.batteries.b${i}.voltage`] = 12
     t.observeDelta(sourceDelta('can0.200', values), T0 + 1000)
 
-    const { devices } = t.snapshot(T0 + 1000).payload
+    const { devices } = t.snapshot(T0 + IDENTITY_SETTLE_MS + 1000).payload
     expect(devices).toHaveLength(MAX_DEVICES)
     expect(devices.find((d) => d.address === 200)!.paths).toHaveLength(MAX_PATHS_PER_DEVICE)
     // The most recently seen win: the oldest addresses are the ones left out.

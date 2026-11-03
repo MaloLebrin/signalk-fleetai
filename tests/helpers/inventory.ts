@@ -1,6 +1,8 @@
 import { SELF } from './runtime'
 import type { Delta } from '../../src/types'
 
+export const SALT = '0123456789abcdef0123456789abcdef'
+
 /** A `sources` tree shaped like the one the Signal K server keeps. */
 export function sourcesTree(): Record<string, unknown> {
   return {

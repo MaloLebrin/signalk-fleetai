@@ -88,6 +88,7 @@ export function createRuntime(options: RuntimeOptions) {
   })
 
   let fatal = false
+  let stopped = false
   let draining = false
   let lastAcceptedAtMs: number | null = null
   let nextAttemptAtMs: number | null = null
@@ -95,7 +96,7 @@ export function createRuntime(options: RuntimeOptions) {
   let lastFailure: string | null = null
 
   function handleDelta(delta: Delta) {
-    if (fatal) return
+    if (fatal || stopped) return
     const atMs = now()
     options.inventory?.tracker.observeDelta(delta, atMs)
     if (ais.ingest(delta, atMs)) return
@@ -152,7 +153,7 @@ export function createRuntime(options: RuntimeOptions) {
   }
 
   function handleFatal(outcome: Extract<SendOutcome, { kind: 'fatal' }>) {
-    if (fatal) return
+    if (fatal || stopped) return
     fatal = true
     const headline = outcome.error === 'unauthorized' ? 'Token rejected' : 'Stopped'
     status.setError(`${headline}: ${outcome.message}`)
@@ -164,19 +165,24 @@ export function createRuntime(options: RuntimeOptions) {
 
   /** Posts the device inventory if it changed (at most once a minute). */
   async function syncInventory(): Promise<void> {
-    if (fatal || !options.inventory) return
+    if (fatal || stopped || !options.inventory) return
     const result = await options.inventory.sync.run()
-    if (result.kind === 'fatal') handleFatal(result.outcome)
+    if (result.kind === 'fatal' && !stopped) {
+      // Not `handleFatal`: the readings keep flowing without the inventory.
+      log.error(
+        `Device inventory disabled until restart (HTTP ${result.outcome.status} ${result.outcome.error}): ${result.outcome.message}`
+      )
+    }
   }
 
   /** Raw NMEA 2000 message (PGN 126996 / 60928) for the inventory fallback. */
   function handlePgn(message: unknown) {
-    if (fatal) return
+    if (fatal || stopped) return
     options.inventory?.tracker.observePgn(message, now())
   }
 
   async function drain(): Promise<void> {
-    if (draining || fatal) return
+    if (draining || fatal || stopped) return
     draining = true
     try {
       for (;;) {
@@ -226,14 +232,15 @@ export function createRuntime(options: RuntimeOptions) {
 
   /** One period: collect, then drain. */
   async function tick(): Promise<void> {
-    if (fatal) return
+    if (fatal || stopped) return
     collect(now())
     await drain()
   }
 
   /** On stop: close every window and persist, without touching the network. */
   function stop() {
-    if (!fatal) collect(now(), true)
+    if (!fatal && !stopped) collect(now(), true)
+    stopped = true
   }
 
   function state(): RuntimeState {

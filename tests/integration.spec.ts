@@ -215,25 +215,36 @@ describe('integration — plugin against a fake FleetAi endpoint', () => {
       expect(fake.pgnListenerCount()).toBe(0)
     })
 
-    it('a revoked token on the inventory stops the plugin visibly, with a single request', async () => {
+    it('an inventory refused by FleetAi (404, 403, 409…) switches only the inventory off: readings keep flowing', async () => {
       const fleetai = await startFakeFleetAi((batch) =>
         batch.path.endsWith('/inventory')
-          ? { status: 401, body: { error: 'unauthorized' } }
+          ? { status: 404, body: { error: 'source_not_found' } }
           : { status: 200 }
       )
       cleanups.push(fleetai.close)
       const fake = createFakeApp(SELF, sourcesTree())
       const instance = plugin(fake.app as unknown as ServerAPI)
       vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] })
-      instance.start({ endpoint: fleetai.url, token: 'fai_ing_revoked' }, () => {})
+      instance.start({ endpoint: fleetai.url, token: 'fai_ing_x', periodSeconds: 60 }, () => {})
       cleanups.push(() => void instance.stop())
       fake.emit(BOAT_DELTAS[0]!)
 
       await vi.advanceTimersByTimeAsync(15_000)
-      await vi.waitFor(() => expect(fake.errors.at(-1)).toMatch(/^Token rejected/))
-      await vi.advanceTimersByTimeAsync(10 * 60_000)
-      expect(fleetai.received).toHaveLength(1)
-      expect(fake.pgnListenerCount()).toBe(0)
+      await vi.waitFor(() =>
+        expect(fake.logs.some((line) => line.includes('Device inventory disabled'))).toBe(true)
+      )
+      expect(fake.errors).toEqual([]) // not a plugin error: the readings are fine
+      expect(fake.unsubscribedCount()).toBe(0) // still subscribed
+
+      fake.emit(selfDelta('navigation.log', 1000, SELF))
+      await vi.advanceTimersByTimeAsync(120_000)
+      await vi.waitFor(() =>
+        expect(fleetai.received.filter((r) => r.path.endsWith('/ingest')).length).toBeGreaterThan(0)
+      )
+      // One inventory request, then silence for the rest of the session.
+      await vi.advanceTimersByTimeAsync(20 * 60_000)
+      expect(fleetai.received.filter((r) => r.path.endsWith('/inventory'))).toHaveLength(1)
+      expect(fake.errors).toEqual([])
     })
   })
 
