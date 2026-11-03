@@ -4,7 +4,10 @@ import { join } from 'node:path'
 import type { Delta } from '../../src/types'
 
 /** The slice of `ServerAPI` the plugin touches, with everything recorded. */
-export function createFakeApp(selfContext = 'vessels.urn:mrn:imo:mmsi:227000001') {
+export function createFakeApp(
+  selfContext = 'vessels.urn:mrn:imo:mmsi:227000001',
+  sources: Record<string, unknown> = {}
+) {
   const dataDir = mkdtempSync(join(tmpdir(), 'signalk-fleetai-'))
   const statuses: string[] = []
   const errors: string[] = []
@@ -14,6 +17,7 @@ export function createFakeApp(selfContext = 'vessels.urn:mrn:imo:mmsi:227000001'
     callback: (delta: Delta) => void
   }> = []
   let unsubscribed = 0
+  const listeners = new Map<string, Set<(message: unknown) => void>>()
 
   const debug = Object.assign((message: string) => void logs.push(message), { enabled: true })
 
@@ -25,6 +29,14 @@ export function createFakeApp(selfContext = 'vessels.urn:mrn:imo:mmsi:227000001'
     setPluginError: (message: string) => void errors.push(message),
     debug,
     error: (message: string) => void logs.push(`ERROR ${message}`),
+    getPath: (path: string) => (path === 'sources' ? sources : undefined),
+    on(event: string, listener: (message: unknown) => void) {
+      if (!listeners.has(event)) listeners.set(event, new Set())
+      listeners.get(event)!.add(listener)
+    },
+    removeListener(event: string, listener: (message: unknown) => void) {
+      listeners.get(event)?.delete(listener)
+    },
     handleMessage: () => {
       throw new Error('the plugin must stay read-only')
     },
@@ -55,8 +67,16 @@ export function createFakeApp(selfContext = 'vessels.urn:mrn:imo:mmsi:227000001'
     }
   }
 
+  /** A raw NMEA 2000 message as the server's `N2KAnalyzerOut` event carries it. */
+  function emitPgn(message: unknown) {
+    for (const listener of listeners.get('N2KAnalyzerOut') ?? []) listener(message)
+  }
+
   return {
     app,
+    sources,
+    emitPgn,
+    pgnListenerCount: () => listeners.get('N2KAnalyzerOut')?.size ?? 0,
     dataDir,
     statuses,
     errors,

@@ -4,6 +4,16 @@ export const DEFAULT_ENDPOINT = 'https://fleetai.app/api/instruments/ingest'
 export const DEFAULT_PERIOD_SECONDS = 60
 export const MIN_PERIOD_SECONDS = 10
 export const MAX_PERIOD_SECONDS = 3600
+/**
+ * The inventory lives next to the ingestion route: `…/instruments/ingest` →
+ * `…/instruments/inventory`. Any other path gets `/inventory` appended.
+ */
+export function inventoryEndpointFor(endpoint: string): string {
+  const url = new URL(endpoint)
+  url.pathname = url.pathname.replace(/\/ingest\/?$/, '').replace(/\/$/, '') + '/inventory'
+  return url.toString()
+}
+
 export const TOKEN_PREFIX = 'fai_ing_'
 
 /** JSON schema rendered by the Signal K admin UI (Plugin Config → FleetAi). */
@@ -39,6 +49,13 @@ export const CONFIG_SCHEMA = {
         'Extra numeric Signal K paths (or wildcards such as electrical.ac.*.voltage) to send on top of the FleetAi catalog. A path FleetAi refuses is dropped for the session.',
       default: [],
       items: { type: 'string' },
+    },
+    hideSerialNumbers: {
+      type: 'boolean',
+      title: 'Hide device serial numbers',
+      description:
+        'The device inventory sent to FleetAi lists your NMEA 2000 devices. When ticked, serial numbers are replaced by a short hash and never leave the boat in clear.',
+      default: false,
     },
   },
 } as const
@@ -89,5 +106,15 @@ export function resolveConfig(raw: unknown): ConfigResult {
         .map((path) => path.trim())
     : []
 
-  return { ok: true, config: { endpoint: url.toString(), token, periodSeconds, paths } }
+  return {
+    ok: true,
+    config: {
+      endpoint: url.toString(),
+      token,
+      periodSeconds,
+      paths,
+      hideSerialNumbers: input.hideSerialNumbers === true,
+      inventoryEndpoint: inventoryEndpointFor(url.toString()),
+    },
+  }
 }

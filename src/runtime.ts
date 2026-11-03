@@ -1,6 +1,8 @@
 import { chunkSamples, createAggregator } from './aggregator'
 import { AIS_PATH_PREFIX, AIS_SPEC, extraPathMatcher, windowRule } from './catalog'
 import { aisValueToJson, createAisTracker } from './ais_tracker'
+import type { InventoryTracker } from './inventory'
+import type { InventorySync } from './inventory_sync'
 import { normalizeDelta } from './normalizer'
 import { createQueue, type Queue } from './queue'
 import type { Sender, SendOutcome } from './sender'
@@ -34,6 +36,8 @@ export interface RuntimeOptions {
   sender: Sender
   log: RuntimeLogger
   status: RuntimeStatus
+  /** Device inventory (optional): the tracker fed by deltas / PGNs and the sync that posts it. */
+  inventory?: { tracker: InventoryTracker; sync: InventorySync }
   /** Called once on a fatal answer — the plugin unsubscribes and stops its timer. */
   onFatal?: (outcome: Extract<SendOutcome, { kind: 'fatal' }>) => void
   now?: () => number
@@ -84,6 +88,7 @@ export function createRuntime(options: RuntimeOptions) {
   })
 
   let fatal = false
+  let stopped = false
   let draining = false
   let lastAcceptedAtMs: number | null = null
   let nextAttemptAtMs: number | null = null
@@ -91,8 +96,9 @@ export function createRuntime(options: RuntimeOptions) {
   let lastFailure: string | null = null
 
   function handleDelta(delta: Delta) {
-    if (fatal) return
+    if (fatal || stopped) return
     const atMs = now()
+    options.inventory?.tracker.observeDelta(delta, atMs)
     if (ais.ingest(delta, atMs)) return
     for (const sample of normalizeDelta(delta, {
       selfContext: options.selfContext,
@@ -146,8 +152,37 @@ export function createRuntime(options: RuntimeOptions) {
     status.setStatus(queued > 0 ? `Sending first batch (${queued} queued)` : 'Collecting readings')
   }
 
+  function handleFatal(outcome: Extract<SendOutcome, { kind: 'fatal' }>) {
+    if (fatal || stopped) return
+    fatal = true
+    const headline = outcome.error === 'unauthorized' ? 'Token rejected' : 'Stopped'
+    status.setError(`${headline}: ${outcome.message}`)
+    log.error(
+      `${headline} (HTTP ${outcome.status} ${outcome.error}) — plugin stopped, ${queue.size()} batch(es) kept on disk`
+    )
+    options.onFatal?.(outcome)
+  }
+
+  /** Posts the device inventory if it changed (at most once a minute). */
+  async function syncInventory(): Promise<void> {
+    if (fatal || stopped || !options.inventory) return
+    const result = await options.inventory.sync.run()
+    if (result.kind === 'fatal' && !stopped) {
+      // Not `handleFatal`: the readings keep flowing without the inventory.
+      log.error(
+        `Device inventory disabled until restart (HTTP ${result.outcome.status} ${result.outcome.error}): ${result.outcome.message}`
+      )
+    }
+  }
+
+  /** Raw NMEA 2000 message (PGN 126996 / 60928) for the inventory fallback. */
+  function handlePgn(message: unknown) {
+    if (fatal || stopped) return
+    options.inventory?.tracker.observePgn(message, now())
+  }
+
   async function drain(): Promise<void> {
-    if (draining || fatal) return
+    if (draining || fatal || stopped) return
     draining = true
     try {
       for (;;) {
@@ -179,13 +214,7 @@ export function createRuntime(options: RuntimeOptions) {
           break
         }
         if (outcome.kind === 'fatal') {
-          fatal = true
-          const headline = outcome.error === 'unauthorized' ? 'Token rejected' : 'Stopped'
-          status.setError(`${headline}: ${outcome.message}`)
-          log.error(
-            `${headline} (HTTP ${outcome.status} ${outcome.error}) — plugin stopped, ${queue.size()} batch(es) kept on disk`
-          )
-          options.onFatal?.(outcome)
+          handleFatal(outcome)
           break
         }
         // drop: the batch itself is refused — log it in full and move on.
@@ -203,14 +232,15 @@ export function createRuntime(options: RuntimeOptions) {
 
   /** One period: collect, then drain. */
   async function tick(): Promise<void> {
-    if (fatal) return
+    if (fatal || stopped) return
     collect(now())
     await drain()
   }
 
   /** On stop: close every window and persist, without touching the network. */
   function stop() {
-    if (!fatal) collect(now(), true)
+    if (!fatal && !stopped) collect(now(), true)
+    stopped = true
   }
 
   function state(): RuntimeState {
@@ -225,7 +255,7 @@ export function createRuntime(options: RuntimeOptions) {
     }
   }
 
-  return { handleDelta, tick, drain, stop, state, collect, refreshStatus }
+  return { handleDelta, handlePgn, syncInventory, tick, drain, stop, state, collect, refreshStatus }
 }
 
 export type Runtime = ReturnType<typeof createRuntime>

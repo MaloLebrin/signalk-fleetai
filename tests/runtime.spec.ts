@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createRuntime } from '../src/runtime'
 import { createSender } from '../src/sender'
-import { aisDelta, harness, scriptedFetch, selfDelta, SELF, T0 } from './helpers/runtime'
+import { aisDelta, config, harness, scriptedFetch, selfDelta, SELF, T0 } from './helpers/runtime'
 
 const MIN = 60_000
 
@@ -262,7 +262,7 @@ describe('runtime — persistence across restarts', () => {
     })
     const clock = { now: T0 }
     const runtime = createRuntime({
-      config: { endpoint: 'http://x', token: 'fai_ing_x', periodSeconds: 60, paths: [] },
+      config: config({ endpoint: 'http://x', token: 'fai_ing_x' }),
       selfContext: SELF,
       queueFilePath: `${harness({ fetch: scriptedFetch([{ status: 200 }]).fetch }).queueFilePath}.b`,
       sender,
@@ -278,5 +278,60 @@ describe('runtime — persistence across restarts', () => {
     release!()
     await Promise.all([first, second])
     expect(runtime.state().queued).toBe(0)
+  })
+})
+
+describe('runtime — answers that arrive after stop()', () => {
+  it('a late 401 on a batch does not fire onFatal nor set an error', async () => {
+    let answer!: () => void
+    const fetch = () =>
+      new Promise<Response>((resolve) => {
+        answer = () => resolve(new Response('{"error":"unauthorized"}', { status: 401 }))
+      })
+    const h = harness({ fetch })
+    h.runtime.handleDelta(selfDelta('navigation.headingTrue', 1))
+    h.clock.now = T0 + MIN
+    const pending = h.runtime.tick()
+    await Promise.resolve()
+    h.runtime.stop()
+    answer()
+    await pending
+    expect(h.fatal).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(h.runtime.state().fatal).toBe(false)
+  })
+
+  it('a late fatal answer on the inventory logs nothing once stopped', async () => {
+    let finish!: (value: unknown) => void
+    const run = () => new Promise((resolve) => (finish = resolve))
+    const h = harness({
+      fetch: scriptedFetch([{ status: 200 }]).fetch,
+      runtime: {
+        inventory: {
+          tracker: { observeDelta: () => {}, observePgn: () => {}, snapshot: () => ({}) },
+          sync: { run, state: () => ({}) },
+        } as never,
+      },
+    })
+    const pending = h.runtime.syncInventory()
+    h.runtime.stop()
+    finish({
+      kind: 'fatal',
+      outcome: { kind: 'fatal', status: 404, error: 'source_not_found', message: 'gone' },
+    })
+    await pending
+    expect(h.logs.filter((line) => line.startsWith('ERROR'))).toEqual([])
+    expect(h.fatal).toEqual([])
+  })
+
+  it('after stop(), deltas, ticks and PGNs are ignored', async () => {
+    const { fetch, calls } = scriptedFetch([{ status: 200 }])
+    const h = harness({ fetch })
+    h.runtime.stop()
+    h.runtime.handleDelta(selfDelta('navigation.headingTrue', 1))
+    h.clock.now = T0 + 5 * MIN
+    await h.runtime.tick()
+    expect(calls).toHaveLength(0)
+    expect(h.runtime.state().queued).toBe(0)
   })
 })

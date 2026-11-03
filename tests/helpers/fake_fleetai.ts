@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net'
 
 export interface ReceivedBatch {
+  path: string
   authorization: string | null
   contentType: string | null
   userAgent: string | null
@@ -24,6 +25,7 @@ export async function startFakeFleetAi(responder?: Responder) {
     req.on('data', (chunk: Buffer) => (raw += chunk.toString()))
     req.on('end', () => {
       const batch: ReceivedBatch = {
+        path: req.url ?? '',
         authorization: req.headers.authorization ?? null,
         contentType: req.headers['content-type'] ?? null,
         userAgent: req.headers['user-agent'] ?? null,
@@ -57,6 +59,7 @@ export async function startFakeFleetAi(responder?: Responder) {
 
   return {
     url: `http://127.0.0.1:${port}/api/instruments/ingest`,
+    inventoryUrl: `http://127.0.0.1:${port}/api/instruments/inventory`,
     received,
     setResponder(next: Responder) {
       respond = next
